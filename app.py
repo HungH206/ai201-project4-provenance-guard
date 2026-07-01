@@ -13,26 +13,31 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 import audit
-from signals import predictability_score
+import scoring
+from labels import make_label
+from signals import predictability_score, stylistic_score
 
 app = Flask(__name__)
 
-# Rate limiting on the LLM-backed endpoints (planning.md §1 cross-cutting).
+# Rate limiting on the LLM-backed endpoints (planning.md §1; limits justified in
+# README). Explicit in-memory storage (Flask-Limiter ≥3 requires storage_uri).
 limiter = Limiter(
-    key_func=get_remote_address,
+    get_remote_address,
     app=app,
-    default_limits=["100 per hour"],
+    default_limits=[],
+    storage_uri="memory://",
 )
+
+# /submit limits: a real writer submits their own work a handful of times a
+# minute at most; 10/min absorbs edit-resubmits while blocking a flood, and
+# 100/day caps sustained abuse (each submit costs two Groq calls).
+SUBMIT_LIMITS = "10 per minute;100 per day"
+# Appeals are rare human actions — a generous ceiling that still stops scripting.
+APPEAL_LIMITS = "20 per hour"
 
 # Guard rails on ingestion (planning.md §2 step 1, §7 edge case 3).
 MAX_TEXT_CHARS = 20_000
 MIN_TEXT_CHARS = 1
-
-# Placeholders until confidence scoring (M4) and transparency labels (M5) land.
-# Kept explicitly null/marked so they can't be mistaken for a real result.
-PLACEHOLDER_ATTRIBUTION = None
-PLACEHOLDER_CONFIDENCE = None
-PLACEHOLDER_LABEL = "PENDING — confidence scoring (M4) and transparency label (M5) not yet implemented"
 
 
 @app.get("/health")
@@ -56,7 +61,7 @@ def log():
 
 
 @app.post("/submit")
-@limiter.limit("20 per minute")
+@limiter.limit(SUBMIT_LIMITS)
 def submit():
     """Accept a submission and run the first detection signal.
 
@@ -81,25 +86,33 @@ def submit():
     content_id = str(uuid.uuid4())
     text = text.strip()
 
-    # Signal 1 (planning.md §3). Signal 2 + scoring + label follow in M4/M5.
-    signal1 = predictability_score(text)
+    # Two independent signals (planning.md §3), then combined scoring (§4).
+    signal1 = predictability_score(text)   # Signal 1: predictability
+    signal2 = stylistic_score(text)        # Signal 2: stylistic fingerprint
+    result = scoring.classify(signal1["score"], signal2["score"])
+    label = make_label(result)             # transparency label text (planning.md §5)
 
-    # Structured audit entry (planning.md §6). `attribution` and `confidence`
-    # are null until M4 adds the second signal + combined scoring; `llm_score`
-    # is signal 1's output, available now. status="pending_scoring" -> "classified"
-    # once M4 lands. The content_id lives here so /appeal can look it up.
+    # Structured audit entry (planning.md §6): both signals' individual scores
+    # alongside the combined ai_score/agreement/attribution/confidence + label.
     audit.append(
         {
             "type": "submission",
             "content_id": content_id,
             "creator_id": creator_id,
-            "attribution": PLACEHOLDER_ATTRIBUTION,
-            "confidence": PLACEHOLDER_CONFIDENCE,
-            "llm_score": signal1["score"],
-            "status": "pending_scoring",
+            "attribution": result["attribution"],
+            "confidence": result["confidence"],
+            "ai_score": result["ai_score"],
+            "agreement": result["agreement"],
+            "signal_1_score": signal1["score"],
+            "signal_2_score": signal2["score"],
+            "label": label,
+            "status": "classified",
+            "appealed": False,
             "text_hash": audit.text_hash(text),
             "signal_1_rationale": signal1.get("rationale"),
             "signal_1_error": signal1.get("error"),
+            "signal_2_rationale": signal2.get("rationale"),
+            "signal_2_error": signal2.get("error"),
         }
     )
 
@@ -107,11 +120,67 @@ def submit():
         {
             "content_id": content_id,
             "creator_id": creator_id,
-            "attribution": PLACEHOLDER_ATTRIBUTION,
-            "confidence": PLACEHOLDER_CONFIDENCE,
-            "llm_score": signal1["score"],
-            "label": PLACEHOLDER_LABEL,
-            "signals": {"predictability": signal1},
+            "attribution": result["attribution"],
+            "confidence": result["confidence"],
+            "ai_score": result["ai_score"],
+            "agreement": result["agreement"],
+            "label": label,
+            "signals": {"predictability": signal1, "stylistic": signal2},
+        }
+    )
+
+
+@app.post("/appeal")
+@limiter.limit(APPEAL_LIMITS)
+def appeal():
+    """Let a creator contest a classification (planning.md §6).
+
+    Body: {"content_id": <str>, "creator_reasoning": <str>}
+    Logs the appeal alongside the original decision, sets status "under_review",
+    and returns a confirmation. No automated re-classification.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+
+    content_id = data.get("content_id")
+    reasoning = data.get("creator_reasoning")
+    if not isinstance(content_id, str) or not content_id.strip():
+        return jsonify({"error": "Field 'content_id' is required and must be a non-empty string."}), 400
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        return jsonify({"error": "Field 'creator_reasoning' is required and must be a non-empty string."}), 400
+
+    history = audit.find_by_content_id(content_id)
+    submission = next((e for e in history if e.get("type") == "submission"), None)
+    if submission is None:
+        return jsonify({"error": f"Unknown content_id: {content_id}"}), 404
+
+    # One open appeal at a time (planning.md §6).
+    if any(e.get("type") == "appeal" for e in history):
+        return jsonify({"error": "An appeal for this content_id is already on record."}), 409
+
+    # Append the appeal alongside the original decision. Log is append-only:
+    # the original submission entry is preserved; this new entry carries the
+    # under_review status and the creator's reasoning.
+    entry = audit.append(
+        {
+            "type": "appeal",
+            "content_id": content_id,
+            "creator_id": submission.get("creator_id"),
+            "status": "under_review",
+            "appeal_reasoning": reasoning.strip(),
+            "original_attribution": submission.get("attribution"),
+            "original_confidence": submission.get("confidence"),
+            "original_timestamp": submission.get("timestamp"),
+        }
+    )
+
+    return jsonify(
+        {
+            "content_id": content_id,
+            "status": "under_review",
+            "message": "Appeal received and logged for human review.",
+            "appeal_logged_at": entry["timestamp"],
         }
     )
 

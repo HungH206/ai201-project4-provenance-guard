@@ -156,40 +156,56 @@ documented as a known limitation.
 variant regardless of where `ai_score` falls — we refuse to assert "likely AI/human"
 when the two detectors contradict each other.
 
+**Numeric confidence** (the single 0–1 number in the API/audit): how strong the
+call is, discounted by how much the signals agree.
+```
+confidence = |ai_score − 0.5| * 2 * agreement
+```
+It is `0` at a neutral score (`ai_score = 0.5`) and approaches `1` only when the
+score is decisive **and** both signals concur. Rounded to two decimals.
+
+> ⚠️ **Known coherence gap (found in M4 calibration, resolve in M5):** the
+> categorical qualifier above is derived from `agreement` alone, so two *agreeing*
+> LLM signals yield "high confidence" even when the numeric confidence is low
+> (e.g. a `0.70` score just over the AI threshold → numeric conf `0.32` but
+> qualifier "high confidence"). This is the two-LLM correlated-failure risk (§3)
+> showing up empirically. **M5 decision:** derive the label's confidence wording
+> from the *numeric* confidence, not raw agreement, so near-boundary calls don't
+> read as "high confidence."
+
 ---
 
 ## 5. Transparency label design  *(Q3)*
 
-Templates with `{ai_score}` (two decimals) and `{conf}` (qualifier from §4) filled
-in. Every variant states it is an automated estimate and points to the appeal route.
+Implemented in `labels.py::make_label`. The variant is chosen by `attribution`;
+`{ai_score}` is filled to two decimals; `{conf}` is the confidence WORD derived
+from the **numeric confidence** (not raw agreement — this resolves the M4 gap):
+`≥ 0.60` → "high confidence", `0.30–0.60` → "moderate confidence", `< 0.30` →
+"low confidence". Every variant states it is an automated estimate, not proof,
+and points to the appeal route.
 
-**Variant A — high-confidence AI** (`ai_score ≥ 0.65`, `agreement ≥ 0.75`):
+**Variant A — AI** (`attribution = likely_ai`):
 ```
-🤖 Likely AI-generated — {conf}.
-Both detectors agree this text shows strong signs of AI authorship
-(AI-likelihood {ai_score}). This is an automated estimate, not proof.
-If you wrote this yourself, you can appeal this label.
-```
-
-**Variant B — high-confidence human** (`ai_score < 0.35`, `agreement ≥ 0.75`):
-```
-✍️ Likely human-written — {conf}.
-Both detectors agree this text reads as human-authored
-(AI-likelihood {ai_score}). This is an automated estimate, not proof.
-You can appeal if you believe this label is wrong.
+🤖 Likely AI-generated — {conf}. Our detectors estimate this text is likely
+AI-generated (AI-likelihood {ai_score}). This is an automated estimate, not
+proof. If you wrote this yourself, you can appeal this label.
 ```
 
-**Variant C — uncertain** (`0.35 ≤ ai_score < 0.65`, *or* `agreement < 0.50` via
-the override rule):
+**Variant B — human** (`attribution = likely_human`):
 ```
-❓ Uncertain — {conf}.
-Our detectors could not reach a confident conclusion (AI-likelihood {ai_score}).
-This text may be AI-assisted, or simply written in a style our tools find hard
-to judge. We are not making a determination. You can appeal to flag this for review.
+✍️ Likely human-written — {conf}. Our detectors estimate this text is likely
+human-authored (AI-likelihood {ai_score}). This is an automated estimate, not
+proof. You can appeal if you believe this label is wrong.
 ```
 
-(`{conf}` resolves to e.g. "high confidence", "moderate confidence", or
-"low confidence — signals disagreed".)
+**Variant C — uncertain** (`attribution = uncertain`; i.e. `0.35 ≤ ai_score <
+0.65` *or* the `agreement < 0.50` override):
+```
+❓ Uncertain — {conf}. Our detectors could not reach a confident conclusion
+(AI-likelihood {ai_score}). This text may be AI-assisted, or simply written in
+a style our tools find hard to judge. We are not making a determination. You can
+appeal to flag this for review.
+```
 
 ---
 
@@ -198,25 +214,24 @@ to judge. We are not making a determination. You can appeal to flag this for rev
 - **Who can appeal:** the creator/submitter — in this project, anyone holding the
   `content_id` returned by `/submit`. (A production version would bind appeals
   to an authenticated owner; noted as a limitation.)
-- **What they provide:** `content_id` (required), `reason` free-text (required),
-  and optional `claimed_origin` ∈ {`human`, `ai_assisted`, `ai`} stating what they
-  say the true provenance is.
-- **What the system does on receipt:**
-  1. Validate the `content_id` exists (else `404`).
-  2. Reject a duplicate open appeal on the same id (`409`) — one open appeal at a time.
-  3. Transition status `active → under_review`.
-  4. Append a **new** audit entry of type `appeal` (the original `submission` entry
-     is never mutated — log is append-only) capturing: timestamp, `reason`,
-     `claimed_origin`, and a pointer to the original entry.
-  5. Return `{ content_id, status: "under_review", message }`.
-- **Status lifecycle:** `active → under_review → {overturned | upheld}`. A human
-  reviewer (out of scope to *build* the reviewer UI this milestone, but the data
-  supports it) sets the terminal status, which appends one more audit entry.
-- **What a reviewer sees in the appeal queue:** a list of `under_review` items, each
-  showing: `content_id`, submission timestamp, the **original label + `ai_score`
-  + `agreement`**, **both signal rationales** (so they see *why* the system decided),
-  the appellant's `reason` and `claimed_origin`, and actions to **uphold** or
-  **overturn** (each writing a final audit entry).
+- **What they provide:** `content_id` (required) and `creator_reasoning`
+  free-text (required) — the creator's explanation of why the label is wrong.
+- **What the system does on receipt** (`POST /appeal`, implemented):
+  1. Validate the `content_id` has a submission entry (else `404`).
+  2. Reject a duplicate appeal on the same id (`409`) — one open appeal at a time.
+  3. Append a **new** audit entry of type `appeal` (the original `submission` entry
+     is never mutated — log is append-only) with `status = "under_review"`, the
+     `appeal_reasoning`, and a pointer to the original decision
+     (`original_attribution`, `original_confidence`, `original_timestamp`).
+  4. Return `{ content_id, status: "under_review", message, appeal_logged_at }`.
+- **Status lifecycle:** `classified → under_review → {overturned | upheld}`. A human
+  reviewer (reviewer UI out of scope to *build*, but the data supports it) sets the
+  terminal status, which appends one more audit entry.
+- **What a reviewer sees in the appeal queue:** the `under_review` entries, each
+  carrying the original decision (`original_attribution`/`original_confidence`) and
+  the appellant's `appeal_reasoning`; joining back to the submission entry by
+  `content_id` surfaces both signal rationales for context. Uphold/overturn actions
+  would each append a final audit entry.
 
 ---
 
@@ -259,7 +274,7 @@ the mitigation:
 | Method | Endpoint | Accepts | Returns |
 |--------|----------|---------|---------|
 | `POST` | `/submit` | `{ "text": "<string>", "creator_id": "<string>" }` | `{ content_id, creator_id, attribution, confidence, llm_score, label, signals: { predictability, stylistic } }` |
-| `POST` | `/appeal` | `{ "content_id", "reason", "claimed_origin"? }` | `{ content_id, status, message }` |
+| `POST` | `/appeal` | `{ "content_id", "creator_reasoning" }` | `{ content_id, status: "under_review", message, appeal_logged_at }` |
 | `GET`  | `/result/{content_id}` | path param | stored label + scores for one submission |
 | `GET`  | `/log` | optional `?limit=N` (default 50) | `{ "entries": [...] }` — most-recent audit entries, newest first |
 | `GET`  | `/audit/{content_id}` | path param | full trail for one content_id (incl. appeals) |
@@ -272,10 +287,13 @@ the mitigation:
 
 **Audit entry schema** (one JSONL line per event; append-only). A `submission`
 entry carries: `timestamp`, `content_id`, `creator_id`, `attribution`
-(`likely_ai` | `uncertain` | `likely_human` — null until M4), `confidence`
-(null until M4), `llm_score` (signal 1, present from M3), `status`
-(`pending_scoring` → `classified` in M4 → `under_review` on appeal), plus
-`text_hash` and signal-1 rationale/error for debugging.
+(`likely_ai` | `uncertain` | `likely_human`), `confidence` (numeric 0–1),
+`ai_score`, `agreement`, both individual signal scores (`signal_1_score`,
+`signal_2_score`), `label`, `status` (`classified`), `appealed` (bool), plus
+`text_hash` and each signal's rationale/error. An `appeal` entry carries:
+`timestamp`, `content_id`, `creator_id`, `status: "under_review"`,
+`appeal_reasoning`, and the original decision pointer (`original_attribution`,
+`original_confidence`, `original_timestamp`).
 
 ---
 

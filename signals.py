@@ -1,11 +1,16 @@
 """Detection signals for Provenance Guard.
 
-Signal contract (planning.md §3): each signal function takes raw text and returns
-a dict {"score": float in [0,1], "rationale": str}. score = P(AI-generated):
-0.0 = confidently human, 1.0 = confidently AI. The score is CONTINUOUS, not a
-binary flag. On any failure (API error, unparseable output) the signal degrades
-to the maximally-uncertain 0.5 and reports the problem in "error" rather than
-crashing the request.
+Two independent LLM judges (planning.md §3), each measuring a DIFFERENT property
+so they aren't redundant:
+  - Signal 1 predictability_score: how low-surprise / templated the text reads.
+  - Signal 2 stylistic_score: human-voice fingerprints vs. AI stylistic hallmarks.
+
+Signal contract: each function takes raw text and returns
+  {"score": float in [0,1], "rationale": str}
+score = P(AI-generated): 0.0 = confidently human, 1.0 = confidently AI.
+CONTINUOUS, not a binary flag. On any failure (API error, unparseable output)
+the signal degrades to the maximally-uncertain 0.5 and reports the problem in
+"error" rather than crashing the request.
 """
 
 import json
@@ -34,7 +39,6 @@ def _get_client():
 
 
 def _clamp01(value):
-    """Coerce to a float in [0, 1]; return None if it isn't a number."""
     try:
         return max(0.0, min(1.0, float(value)))
     except (TypeError, ValueError):
@@ -57,6 +61,55 @@ def _extract_json(raw):
     return None
 
 
+def _run_judge(system_prompt, text):
+    """Shared LLM-judge machinery for both signals. Returns
+    {"score": float, "rationale": str} and, on degradation, an "error" str
+    with score defaulted to 0.5."""
+    if not text or not text.strip():
+        return {
+            "score": 0.5,
+            "rationale": "Empty text; cannot assess.",
+            "error": "empty_input",
+        }
+
+    try:
+        response = _get_client().chat.completions.create(
+            model=_MODEL,
+            temperature=_TEMPERATURE,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+        )
+    except Exception as exc:  # network / auth / rate-limit — degrade, don't crash
+        return {
+            "score": 0.5,
+            "rationale": "Signal unavailable; defaulted to uncertain.",
+            "error": f"api_error: {exc}",
+        }
+
+    raw = response.choices[0].message.content
+    parsed = _extract_json(raw)
+    if parsed is None:
+        return {
+            "score": 0.5,
+            "rationale": "Could not parse signal response; defaulted to uncertain.",
+            "error": "parse_error",
+        }
+
+    score = _clamp01(parsed.get("score"))
+    if score is None:
+        return {
+            "score": 0.5,
+            "rationale": "Signal response had no numeric score; defaulted to uncertain.",
+            "error": "missing_score",
+        }
+
+    rationale = parsed.get("rationale") or "No rationale provided."
+    return {"score": score, "rationale": str(rationale)}
+
+
 # --- Signal 1: Predictability judge (planning.md §3) -----------------------
 
 _PREDICTABILITY_SYSTEM = (
@@ -74,75 +127,52 @@ _PREDICTABILITY_SYSTEM = (
 
 
 def predictability_score(text):
-    """Signal 1 — estimate how AI-like the text is based on predictability.
+    """Signal 1 — estimate how AI-like the text is based on predictability."""
+    return _run_judge(_PREDICTABILITY_SYSTEM, text)
 
-    Returns {"score": float in [0,1], "rationale": str} and, on degradation,
-    an additional "error": str with score defaulted to 0.5.
-    """
-    if not text or not text.strip():
-        return {
-            "score": 0.5,
-            "rationale": "Empty text; cannot assess predictability.",
-            "error": "empty_input",
-        }
 
-    try:
-        response = _get_client().chat.completions.create(
-            model=_MODEL,
-            temperature=_TEMPERATURE,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": _PREDICTABILITY_SYSTEM},
-                {"role": "user", "content": text},
-            ],
-        )
-    except Exception as exc:  # network / auth / rate-limit — degrade, don't crash
-        return {
-            "score": 0.5,
-            "rationale": "Predictability signal unavailable; defaulted to uncertain.",
-            "error": f"api_error: {exc}",
-        }
+# --- Signal 2: Stylistic-fingerprint judge (planning.md §3) ----------------
 
-    raw = response.choices[0].message.content
-    parsed = _extract_json(raw)
-    if parsed is None:
-        return {
-            "score": 0.5,
-            "rationale": "Could not parse predictability response; defaulted to uncertain.",
-            "error": "parse_error",
-        }
+_STYLISTIC_SYSTEM = (
+    "You are a stylometric analyst that estimates machine authorship from STYLE "
+    "alone. Human writing tends to carry a personal voice: concrete first-hand "
+    "specifics, idiom, humor, opinion, uneven rhythm, and small imperfections. "
+    "AI writing tends toward stylistic hallmarks: even-handed hedging, symmetrical "
+    "'on one hand / on the other' structure, generic transitions (moreover, "
+    "furthermore, it is important to note), uniform politeness, and a polished, "
+    "risk-free register. Judge ONLY style and voice; ignore topic and factual "
+    "correctness. Do NOT reuse a predictability heuristic — assess voice.\n\n"
+    "Respond with ONLY a JSON object, no other text, in this exact shape:\n"
+    '{"score": <number 0.0-1.0>, "rationale": "<one sentence>"}\n'
+    "score = probability the text is AI-generated based on style: "
+    "0.0 = strong human voice, 1.0 = strong AI stylistic hallmarks."
+)
 
-    score = _clamp01(parsed.get("score"))
-    if score is None:
-        return {
-            "score": 0.5,
-            "rationale": "Predictability response had no numeric score; defaulted to uncertain.",
-            "error": "missing_score",
-        }
 
-    rationale = parsed.get("rationale") or "No rationale provided."
-    return {"score": score, "rationale": str(rationale)}
+def stylistic_score(text):
+    """Signal 2 — estimate how AI-like the text is based on style/voice."""
+    return _run_judge(_STYLISTIC_SYSTEM, text)
 
 
 if __name__ == "__main__":
-    # Independent test harness (planning.md §10, M3 verification): call the
-    # signal directly on a few inputs and inspect the output before wiring it
-    # into the endpoint. Run: .venv/bin/python signals.py
+    # Independent test harness (planning.md §10): call each signal directly and
+    # compare. Run: .venv/bin/python signals.py
     samples = {
         "clearly-AI": (
             "In today's fast-paced digital landscape, leveraging synergistic "
             "solutions is paramount. By harnessing the power of innovation, "
-            "organizations can unlock unprecedented value and drive sustainable "
-            "growth across all facets of their operations."
+            "organizations can unlock unprecedented value."
         ),
         "clearly-human": (
-            "ok so i tried the new ramen place by my apartment last night and "
-            "honestly? mid. the broth was way too salty and i waited like 40 min. "
-            "my roommate loved it though so idk maybe it's just me lol"
+            "ok so i tried the new ramen place last night and honestly? mid. "
+            "broth was way too salty and i waited like 40 min lol"
         ),
         "short": "Nice work!",
         "empty": "",
     }
     for name, sample in samples.items():
-        result = predictability_score(sample)
-        print(f"[{name}] -> {json.dumps(result, ensure_ascii=False)}")
+        s1 = predictability_score(sample)
+        s2 = stylistic_score(sample)
+        print(f"[{name}]")
+        print(f"   signal 1 (predictability): {json.dumps(s1, ensure_ascii=False)}")
+        print(f"   signal 2 (stylistic):      {json.dumps(s2, ensure_ascii=False)}")
