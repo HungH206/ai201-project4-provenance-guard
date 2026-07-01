@@ -35,25 +35,25 @@ def make_label(result):
 
     if attribution == "likely_ai":
         return (
-            f"🤖 Likely AI-generated — {word}. "
-            f"Our detectors estimate this text is likely AI-generated "
-            f"(AI-likelihood {ai_score:.2f}). This is an automated estimate, "
+            f"🤖 Likely AI generated ({word}). "
+            f"Our detectors estimate this text was probably written by AI "
+            f"(AI likelihood {ai_score:.2f}). This is an automated estimate, "
             f"not proof. If you wrote this yourself, you can appeal this label."
         )
 
     if attribution == "likely_human":
         return (
-            f"✍️ Likely human-written — {word}. "
-            f"Our detectors estimate this text is likely human-authored "
-            f"(AI-likelihood {ai_score:.2f}). This is an automated estimate, "
+            f"✍️ Likely written by a person ({word}). "
+            f"Our detectors estimate this text was probably written by a human "
+            f"(AI likelihood {ai_score:.2f}). This is an automated estimate, "
             f"not proof. You can appeal if you believe this label is wrong."
         )
 
     # uncertain
     return (
-        f"❓ Uncertain — {word}. "
+        f"❓ Uncertain ({word}). "
         f"Our detectors could not reach a confident conclusion "
-        f"(AI-likelihood {ai_score:.2f}). This text may be AI-assisted, or "
-        f"simply written in a style our tools find hard to judge. We are not "
+        f"(AI likelihood {ai_score:.2f}). This text may be partly AI assisted, "
+        f"or simply written in a style our tools find hard to judge. We are not "
         f"making a determination. You can appeal to flag this for review."
     )

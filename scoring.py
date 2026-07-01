@@ -43,7 +43,7 @@ def confidence_qualifier(agreement):
         return "high confidence"
     if agreement >= AGREEMENT_MODERATE:
         return "moderate confidence"
-    return "low confidence — signals disagreed"
+    return "low confidence (signals disagreed)"
 
 
 def classify(s1, s2):

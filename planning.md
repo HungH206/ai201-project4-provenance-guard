@@ -150,7 +150,7 @@ documented as a known limitation.
 |-------------|-----------|
 | `≥ 0.75` | high confidence |
 | `0.50 – 0.749…` | moderate confidence |
-| `< 0.50` | low confidence — signals disagreed |
+| `< 0.50` | low confidence (signals disagreed) |
 
 **Override rule:** if `agreement < 0.50`, the label is forced to the **Uncertain**
 variant regardless of where `ai_score` falls — we refuse to assert "likely AI/human"
@@ -186,25 +186,25 @@ and points to the appeal route.
 
 **Variant A — AI** (`attribution = likely_ai`):
 ```
-🤖 Likely AI-generated — {conf}. Our detectors estimate this text is likely
-AI-generated (AI-likelihood {ai_score}). This is an automated estimate, not
+🤖 Likely AI generated ({conf}). Our detectors estimate this text was probably
+written by AI (AI likelihood {ai_score}). This is an automated estimate, not
 proof. If you wrote this yourself, you can appeal this label.
 ```
 
 **Variant B — human** (`attribution = likely_human`):
 ```
-✍️ Likely human-written — {conf}. Our detectors estimate this text is likely
-human-authored (AI-likelihood {ai_score}). This is an automated estimate, not
-proof. You can appeal if you believe this label is wrong.
+✍️ Likely written by a person ({conf}). Our detectors estimate this text was
+probably written by a human (AI likelihood {ai_score}). This is an automated
+estimate, not proof. You can appeal if you believe this label is wrong.
 ```
 
 **Variant C — uncertain** (`attribution = uncertain`; i.e. `0.35 ≤ ai_score <
 0.65` *or* the `agreement < 0.50` override):
 ```
-❓ Uncertain — {conf}. Our detectors could not reach a confident conclusion
-(AI-likelihood {ai_score}). This text may be AI-assisted, or simply written in
-a style our tools find hard to judge. We are not making a determination. You can
-appeal to flag this for review.
+❓ Uncertain ({conf}). Our detectors could not reach a confident conclusion
+(AI likelihood {ai_score}). This text may be partly AI assisted, or simply
+written in a style our tools find hard to judge. We are not making a
+determination. You can appeal to flag this for review.
 ```
 
 ---

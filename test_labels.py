@@ -18,14 +18,14 @@ def test_confidence_wording_thresholds():
 
 def test_variant_ai():
     label = make_label(classify(0.9, 0.9))  # likely_ai, conf 0.8
-    assert label.startswith("🤖 Likely AI-generated — high confidence")
-    assert "AI-likelihood 0.90" in label
+    assert label.startswith("🤖 Likely AI generated (high confidence)")
+    assert "AI likelihood 0.90" in label
     assert "appeal" in label
 
 
 def test_variant_human():
     label = make_label(classify(0.1, 0.15))  # likely_human
-    assert label.startswith("✍️ Likely human-written")
+    assert label.startswith("✍️ Likely written by a person")
     assert "appeal" in label
 
 
