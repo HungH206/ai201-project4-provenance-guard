@@ -37,9 +37,11 @@ Cross-cutting: **rate limiting** (flask-limiter) on the LLM-backed endpoints.
 
 ## 2. Architecture narrative — the path of one piece of text
 
-1. **Arrival (`POST /submit`).** JSON body with `text`. The submission layer
-   validates (non-empty, ≤ length bound, valid UTF-8), assigns a `submission_id`,
-   normalizes whitespace, and applies the rate limit. → passes `text` + `submission_id`.
+1. **Arrival (`POST /submit`).** JSON body with `text` and `creator_id` (the
+   latter binds the submission to a creator so appeals are ownable, §6). The
+   submission layer validates (both non-empty strings, `text` ≤ length bound,
+   valid UTF-8), assigns a `content_id`, normalizes whitespace, and applies the
+   rate limit. → passes `text` + `creator_id` + `content_id`.
 2. **Signal 1 — Predictability judge (Groq).** Measures how low-surprise/templated
    the text reads (perplexity proxy). → `s1 ∈ [0,1]` + rationale.
 3. **Signal 2 — Stylistic-fingerprint judge (Groq).** Independently prompted;
@@ -48,12 +50,12 @@ Cross-cutting: **rate limiting** (flask-limiter) on the LLM-backed endpoints.
    → `ai_score`, `agreement`.
 5. **Transparency label.** Maps `ai_score` (which band) + `agreement` (confidence
    qualifier) to one of three label variants. → `label` text + numbers.
-6. **Audit log.** Append entry: `submission_id`, ts, text hash, `s1`, `s2`,
+6. **Audit log.** Append entry: `content_id`, ts, text hash, `s1`, `s2`,
    rationales, `ai_score`, `agreement`, `label`, `status="active"`. → confirmation.
-7. **Response.** Returns `submission_id`, `label`, `ai_score`, `confidence`,
+7. **Response.** Returns `content_id`, `label`, `ai_score`, `confidence`,
    per-signal breakdown.
 
-**Appeal flow (separate request):** `POST /appeal` with `submission_id` + reason →
+**Appeal flow (separate request):** `POST /appeal` with `content_id` + reason →
 appeal handler looks up the entry → status `active → under_review` → appends a
 *new* audit entry (original preserved; log is append-only) → returns updated status.
 
@@ -194,24 +196,24 @@ to judge. We are not making a determination. You can appeal to flag this for rev
 ## 6. Appeals workflow  *(Q4)*
 
 - **Who can appeal:** the creator/submitter — in this project, anyone holding the
-  `submission_id` returned by `/submit`. (A production version would bind appeals
+  `content_id` returned by `/submit`. (A production version would bind appeals
   to an authenticated owner; noted as a limitation.)
-- **What they provide:** `submission_id` (required), `reason` free-text (required),
+- **What they provide:** `content_id` (required), `reason` free-text (required),
   and optional `claimed_origin` ∈ {`human`, `ai_assisted`, `ai`} stating what they
   say the true provenance is.
 - **What the system does on receipt:**
-  1. Validate the `submission_id` exists (else `404`).
+  1. Validate the `content_id` exists (else `404`).
   2. Reject a duplicate open appeal on the same id (`409`) — one open appeal at a time.
   3. Transition status `active → under_review`.
   4. Append a **new** audit entry of type `appeal` (the original `submission` entry
      is never mutated — log is append-only) capturing: timestamp, `reason`,
      `claimed_origin`, and a pointer to the original entry.
-  5. Return `{ submission_id, status: "under_review", message }`.
+  5. Return `{ content_id, status: "under_review", message }`.
 - **Status lifecycle:** `active → under_review → {overturned | upheld}`. A human
   reviewer (out of scope to *build* the reviewer UI this milestone, but the data
   supports it) sets the terminal status, which appends one more audit entry.
 - **What a reviewer sees in the appeal queue:** a list of `under_review` items, each
-  showing: `submission_id`, submission timestamp, the **original label + `ai_score`
+  showing: `content_id`, submission timestamp, the **original label + `ai_score`
   + `agreement`**, **both signal rationales** (so they see *why* the system decided),
   the appellant's `reason` and `claimed_origin`, and actions to **uphold** or
   **overturn** (each writing a final audit entry).
@@ -256,15 +258,24 @@ the mitigation:
 
 | Method | Endpoint | Accepts | Returns |
 |--------|----------|---------|---------|
-| `POST` | `/submit` | `{ "text": "<string>" }` | `{ submission_id, label, ai_score, confidence, signals: { predictability, stylistic } }` |
-| `POST` | `/appeal` | `{ "submission_id", "reason", "claimed_origin"? }` | `{ submission_id, status, message }` |
-| `GET`  | `/result/{submission_id}` | path param | stored label + scores for one submission |
-| `GET`  | `/audit` / `/audit/{submission_id}` | optional path param | audit entries (full trail incl. appeals) |
+| `POST` | `/submit` | `{ "text": "<string>", "creator_id": "<string>" }` | `{ content_id, creator_id, attribution, confidence, llm_score, label, signals: { predictability, stylistic } }` |
+| `POST` | `/appeal` | `{ "content_id", "reason", "claimed_origin"? }` | `{ content_id, status, message }` |
+| `GET`  | `/result/{content_id}` | path param | stored label + scores for one submission |
+| `GET`  | `/log` | optional `?limit=N` (default 50) | `{ "entries": [...] }` — most-recent audit entries, newest first |
+| `GET`  | `/audit/{content_id}` | path param | full trail for one content_id (incl. appeals) |
 | `GET`  | `/health` | — | `{ "status": "ok" }` |
 
 - All bodies/responses JSON. `/submit` and `/appeal` are rate-limited.
+- `/log` has no auth by design — it exists for documentation/grading visibility.
 - Errors: JSON `{ "error": "<message>" }` with `400` (bad input), `404` (unknown id),
   `409` (duplicate open appeal), `429` (rate-limited).
+
+**Audit entry schema** (one JSONL line per event; append-only). A `submission`
+entry carries: `timestamp`, `content_id`, `creator_id`, `attribution`
+(`likely_ai` | `uncertain` | `likely_human` — null until M4), `confidence`
+(null until M4), `llm_score` (signal 1, present from M3), `status`
+(`pending_scoring` → `classified` in M4 → `under_review` on appeal), plus
+`text_hash` and signal-1 rationale/error for debugging.
 
 ---
 
@@ -278,7 +289,7 @@ and fanned out to two independent Groq judges (Signal 1 = predictability, Signal
 stylistic fingerprint), whose `[0,1]` scores are combined into `ai_score` (the AI
 likelihood) and `agreement` (reliability), mapped to one of three transparency-label
 variants, written to the append-only audit log, and returned to the caller.
-**Appeal flow:** a creator `POST`s the `submission_id` plus a reason to `/appeal`;
+**Appeal flow:** a creator `POST`s the `content_id` plus a reason to `/appeal`;
 the handler looks the entry up, transitions its status `active → under_review`, and
 appends a *new* audit entry — the original record is never mutated — then returns the
 updated status.
@@ -287,7 +298,7 @@ updated status.
 ```
             { text }
 client ───────────────▶ POST /submit
-                            │  validated, normalized text + submission_id
+                            │  validated, normalized text + content_id
                             ▼
                     ┌───────────────────┐      ┌───────────────────┐
                     │ Signal 1: LLM     │      │ Signal 2: LLM     │
@@ -316,16 +327,16 @@ client ───────────────▶ POST /submit
                         │ ai_score, agreement,     │
                         │ label, status=active     │
                         └─────────────────────────┘
-                                     │ submission_id + label + scores
+                                     │ content_id + label + scores
                                      ▼
 client ◀──────────────────────────────  JSON response
 ```
 
 ### Appeal flow
 ```
-        { submission_id, reason, claimed_origin? }
+        { content_id, reason, claimed_origin? }
 creator ─────────────────────────────────▶ POST /appeal
-                                               │ submission_id
+                                               │ content_id
                                                ▼
                                       ┌────────────────────┐
                                       │ Appeal handler      │
@@ -342,7 +353,7 @@ creator ────────────────────────
                                       └────────────────────┘
                                                │ updated status
                                                ▼
-creator ◀───────────────────────────────────  { submission_id, status, message }
+creator ◀───────────────────────────────────  { content_id, status, message }
 ```
 
 ---
